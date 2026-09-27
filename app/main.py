@@ -1,0 +1,175 @@
+"""FastAPI 入口：依赖图发布 / 回滚 / 重试 / 查询 API。"""
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
+
+from . import config, service
+from .database import init_db
+from .errors import APIError
+from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 启动时完成 SQLite 初始化（目录不存在会自动创建，重复执行幂等）
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="依赖图发布回滚 API",
+    description="客户端提交服务节点及依赖关系，按拓扑层级生成执行计划，"
+                "支持节点成功/失败回报、失败仅回滚本批次已成功节点、从断点重试、"
+                "乐观锁安全取消（pending/running 批次可取消，逆拓扑回滚已成功节点）。",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(APIError)
+async def api_error_handler(_: Request, exc: APIError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message, **exc.extra}},
+    )
+
+
+@app.get("/health", tags=["meta"])
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.post("/api/releases", status_code=201, tags=["releases"])
+def create_release(payload: CreateReleaseRequest) -> dict:
+    """创建带版本号的发布批次；循环依赖返回 422 cycle_detected。
+
+    可选传 ``targets``（非空、不重复的节点名列表）：先按现有规则校验完整节点与依赖图，
+    再仅持久化每个目标及其全部传递前置依赖构成的诱导子图（共享前置只保留一次）；
+    levels / plan / next_nodes / 回滚 / 关键路径分析全部基于裁剪后的子图。
+    目标不存在返回 422 unknown_target 且整批零写入；不传 targets 时为全量发布。
+    """
+    return service.create_release(payload)
+
+
+@app.get("/api/releases", tags=["releases"])
+def list_releases(limit: int = 50) -> dict:
+    """查询最近的发布批次列表。"""
+    return {"items": service.list_releases(limit=min(max(limit, 1), 200))}
+
+
+@app.get("/api/releases/{release_id}", tags=["releases"])
+def get_release_status(release_id: str) -> dict:
+    """查询发布状态：每个节点的状态、进度、当前可回报节点。"""
+    return service.get_release(release_id)
+
+
+@app.get("/api/releases/{release_id}/diff", tags=["releases"])
+def diff_release(
+    release_id: str,
+    base_release_id: str = Query(
+        ..., min_length=1,
+        description="基线批次 ID；比较方向为 base -> target（路径上的 release_id 为目标批次）",
+    ),
+) -> dict:
+    """比较两个批次实际持久化的裁剪后图（只读）。
+
+    返回 added / removed / changed；同名节点在节点类型、工期、重试配置、元数据或
+    前置依赖集合任一变化时命中 changed，并给出字段级 reasons（含两侧取值）。
+    impacted_nodes 从 added/changed 沿**目标批次**依赖边向下游传播（含起点）；
+    removed 单独报告，不向已不存在的节点映射。各列表按节点名稳定排序并给出计数。
+    任一缺失批次返回 404 release_not_found；接口不改变任何批次状态。
+    """
+    return service.diff_releases(release_id, base_release_id)
+
+
+@app.get("/api/releases/{release_id}/plan", tags=["releases"])
+def get_release_plan(
+    release_id: str,
+    deadline_seconds: int | None = Query(
+        None, ge=0,
+        description="可选截止工期（秒，非负整数）；仅做可行性分析，不改变批次状态",
+    ),
+) -> dict:
+    """查询拓扑分层执行计划与关键路径（CPM）分析。
+
+    返回最短总工期、各节点最早/最晚开始时间、total_slack、全部零余量关键节点；
+    critical_path 在并列最长路径中取节点名序列字典序最小者。
+    deadline_seconds 小于最短总工期时仍返回完整分析，feasible=false 并给出缺口秒数。
+    """
+    return service.get_release_plan(release_id, deadline_seconds)
+
+
+@app.get("/api/releases/{release_id}/events", tags=["releases"])
+def list_release_events(
+    release_id: str,
+    event_type: str | None = Query(
+        None, min_length=1,
+        description="按事件类型精确过滤：report_success / report_failure / retry_scheduled / "
+                    "rollback / retry_reset / cancelled / cancel_rollback",
+    ),
+    node: str | None = Query(None, min_length=1, description="按节点名精确过滤"),
+    limit: int = Query(50, ge=1, le=200, description="每页条数（1~200，默认 50）"),
+    cursor: str | None = Query(
+        None,
+        description="分页游标：原样回传上一页响应的 next_cursor；"
+                    "无法解析或与当前批次 / 过滤条件不匹配返回 422 invalid_cursor",
+    ),
+) -> dict:
+    """查询批次节点事件审计流（只读，键集游标分页）。
+
+    复用 node_events 审计表，按 (created_at, id) 升序稳定返回节点回报（成功 / 失败）、
+    自动重试调度、失败回滚、断点重试重置与安全取消（含取消回滚）事件。
+    游标绑定批次与 event_type / node 过滤条件：并发写入下翻页不重复、不遗漏；
+    游标无法解析、结构非法或跨批次 / 跨过滤条件复用均返回 422 invalid_cursor。
+    响应包含 items / next_cursor / has_more；批次不存在返回 404 release_not_found。
+    """
+    return service.list_release_events(
+        release_id, event_type=event_type, node=node, limit=limit, cursor=cursor,
+    )
+
+
+@app.post("/api/releases/{release_id}/report", tags=["releases"])
+def report_node(release_id: str, payload: ReportRequest) -> dict:
+    """回报节点执行结果。
+
+    - 跨版本回报 → 409 version_mismatch
+    - 前置节点未全部成功就回报 → 409 out_of_order
+    - 节点处于自动重试等待期（next_retry_at 未到期）→ 409 retry_not_due，状态不变
+    - status=failed 且 attempt_count < max_attempts → 原子递增尝试次数，节点恢复 pending
+      并安排 next_retry_at，不触发批次回滚（result=retry_scheduled）
+    - status=failed 且达到 max_attempts 上限 → 逆拓扑回滚本批次已成功节点，返回可重试断点
+      （旧批次 max_attempts 缺省为 1，首次失败即回滚）
+    """
+    return service.report_node(release_id, payload)
+
+
+@app.post("/api/releases/{release_id}/retry", tags=["releases"])
+def retry_release(release_id: str) -> dict:
+    """从断点续发：重置 failed/rolled_back 节点，从最低待执行层级继续。"""
+    return service.retry_release(release_id)
+
+
+@app.post("/api/releases/{release_id}/cancel", tags=["releases"])
+def cancel_release(release_id: str, payload: CancelReleaseRequest) -> dict:
+    """安全取消发布批次（乐观锁）。
+
+    - 仅 ``pending`` / ``running`` 批次可取消；携带 ``expected_revision``，与当前
+      修订号在同一 SQLite 事务内比较，过期返回 **409 state_conflict** 且状态不变。
+    - 取消成功后：未执行节点（pending，含自动重试等待中的节点）标记为 ``cancelled``，
+      已成功节点按**逆拓扑顺序**回滚为 ``rolled_back``，批次进入终态 ``cancelled``，
+      ``revision`` +1，返回 ``cancelled_nodes`` / ``rolled_back_nodes`` / 新 ``revision``。
+    - 与节点回报并发时，条件状态迁移保证只有一方成功（落败方 409）。
+    - 取消后的批次拒绝 report 与 retry，统一返回 **409 release_cancelled**。
+    - 批次不存在返回 404 release_not_found；已是终态（succeeded / failed /
+      partially_rolled_back）返回 409 cancel_not_allowed。
+    """
+    return service.cancel_release(release_id, payload)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", host=config.HOST, port=config.PORT)
