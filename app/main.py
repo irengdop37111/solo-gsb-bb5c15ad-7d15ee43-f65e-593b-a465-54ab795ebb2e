@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from . import config, service
 from .database import init_db
 from .errors import APIError
-from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest
+from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest, SimulationRequest
 
 
 @asynccontextmanager
@@ -129,6 +129,22 @@ def list_release_events(
     return service.list_release_events(
         release_id, event_type=event_type, node=node, limit=limit, cursor=cursor,
     )
+
+
+@app.post("/api/releases/{release_id}/simulation", tags=["releases"])
+def simulate_release(release_id: str, payload: SimulationRequest) -> dict:
+    """只读排程推演：从批次已保存的节点、依赖与 estimated_seconds 从零时刻模拟。
+
+    请求体携带正整数 ``parallelism``（同时运行节点上限）与可选的节点到**非空资源名**
+    映射 ``resources``；未知节点返回 422 unknown_simulation_node，非法参数返回 422，
+    批次不存在返回 404 release_not_found。
+
+    忽略一切实际回报状态。每个时刻先释放全部已完成节点，再按节点名字典序扫描
+    依赖已完成的节点：跳过资源被占用者，尽量填满并行度空位；未映射资源的节点不占
+    资源，同资源节点互斥；运行不可中断，随后跳至最近完成时刻；零工期节点即时完成
+    并继续调度，缺失工期按零。返回各节点开始 / 结束秒数与总工期，不修改批次或事件。
+    """
+    return service.simulate_release(release_id, payload)
 
 
 @app.post("/api/releases/{release_id}/report", tags=["releases"])

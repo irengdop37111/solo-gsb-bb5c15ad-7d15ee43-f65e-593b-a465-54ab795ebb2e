@@ -16,6 +16,9 @@ report / retry（`409 release_cancelled`）。
 另有只读的**节点事件审计**（`GET /api/releases/{id}/events`）：复用 `node_events` 审计表，
 按 `(created_at, id)` 稳定排序返回节点回报 / 重试 / 回滚 / 取消事件，支持 `event_type` / `node`
 过滤与**绑定批次和过滤条件的游标分页**（并发写入下不重复不遗漏，非法游标返回 422）。
+还有只读的**排程推演**（`POST /api/releases/{id}/simulation`）：读取批次已保存的节点、依赖与
+`estimated_seconds`，**忽略一切实际回报状态**，从 0 时刻按“并行度上限 + 同资源节点互斥”离散
+模拟执行，返回每个节点的开始 / 结束秒数与总工期；推演不修改批次、节点或事件。
 
 ## 一条命令启动
 
@@ -238,6 +241,52 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 接口为**只读**：不改变任何批次 / 节点状态；批次不存在返回 `404 release_not_found`；
   `limit` 越界（非 1~200 整数）或 `event_type` / `node` 为空串返回 `422`（请求参数校验）。
 
+**只读排程推演（并行度 + 资源互斥）**
+
+`POST /api/releases/{id}/simulation` 读取批次**已保存**的节点、依赖与 `estimated_seconds`，
+**忽略节点实际回报状态**（pending / success / failed / rolled_back / cancelled、重试信息等一律不看），
+从 **0 时刻**做离散事件模拟，推演结束后**不修改批次、节点或事件**（不落库、不写审计、不产生 revision 变化，
+可对任意状态的批次重复调用）。
+
+请求体：
+
+```json
+{
+  "parallelism": 2,
+  "resources": {"svc-a": "db-primary", "svc-b": "db-primary"}
+}
+```
+
+- `parallelism`（**必填，正整数**）：同一时刻允许运行的节点数上限；总运行数不会超过它。
+- `resources`（**可选**）：节点名 → **非空资源名**的映射（对象 / JSON map）。
+  - **未映射**资源的节点不占任何资源，只占一个并行度空位；
+  - 映射到**同一资源**的节点**互斥**：该资源上同一时刻至多一个节点在运行。
+
+调度规则（确定性、可复现）：
+
+1. **每个时刻先释放全部已完成节点**（完成时刻恰为当前时刻者），释放其并行度空位与占用的资源；
+2. 再按**节点名字典序**扫描“所有前置依赖均已完成”且尚未启动的节点：
+   - 映射了资源、但该资源正被占用的节点**跳过**（等下一个完成时刻再参与）；
+   - 否则只要并行度还有空位就启动，并沿字典序继续扫描、**尽量把空位填满**；
+3. **运行不可中断**：一轮填充结束后，若仍有未完成节点，则把时钟**跳至最近的运行完成时刻**，
+   回到第 1 步，直到全部节点完成；
+4. **零工期节点即时完成**：`estimated_seconds` 缺失（含旧批次）按 **0** 处理，零工期节点
+   `start == finish`、**不占用并行度空位**、其资源在同一时刻立即释放；零工期节点完成后**继续在本时刻
+   调度**，因此零工期依赖链 / 同资源后继都在同一时刻连锁启动；
+5. 响应返回每个节点（按节点名字典序）的 `estimated_seconds` / `resource`（未映射为 `null`）/
+   `start_seconds` / `finish_seconds`，以及 `parallelism`、回显的 `resources` 与
+   **总工期** `total_duration_seconds`（全部零工期时为 `0`）。
+
+错误与边界：
+
+- 批次不存在 → **`404 release_not_found`**；
+- `resources` 中出现批次里不存在的节点名 → **`422 unknown_simulation_node`**（响应 `nodes` 给出
+  排序后的未知节点名）；
+- 请求体非法（缺 `parallelism`、非正整数、布尔 / 字符串 / 小数，或 `resources` 不是对象、
+  键或资源名为空串、资源名非字符串）→ **`422`**（FastAPI 请求体校验）；`resources` 省略、传
+  `null` 或 `{}` 均合法，表示不施加任何资源互斥；
+- 推演只读取 `nodes` / `edges`（`targets` 裁剪后的持久化图），不开启写事务。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -251,6 +300,7 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/releases/{id}/retry` | 从断点续发（已取消批次返回 409 release_cancelled） |
 | `POST` | `/api/releases/{id}/cancel` | 安全取消 pending/running 批次（body：`reason` + `expected_revision`；同一事务校验修订号，过期 409 state_conflict 且状态不变；未执行节点标 cancelled、已成功节点逆拓扑回滚，返回 cancelled_nodes / rolled_back_nodes / 新 revision；终态批次 409 cancel_not_allowed） |
 | `GET` | `/api/releases/{id}/events?event_type=&node=&limit=&cursor=` | 节点事件审计流（只读；回报 / 重试 / 回滚 / 取消事件按 created_at+id 稳定排序；event_type / node 过滤，limit 1~200 默认 50；游标绑定批次与过滤条件，并发写入不重复不遗漏，非法或跨条件游标 422 invalid_cursor；响应 items / next_cursor / has_more） |
+| `POST` | `/api/releases/{id}/simulation` | 只读排程推演（body：正整数 `parallelism` + 可选节点到非空资源名映射 `resources`；忽略回报状态从 0 时刻离散模拟：先释放已完成节点，再按节点名字典序填满并行度空位、同资源互斥、运行不可中断跳至最近完成时刻，零工期即时完成并继续调度，缺失工期按 0；返回各节点 start_seconds / finish_seconds 与 total_duration_seconds；未知节点 422 unknown_simulation_node、非法参数 422、批次不存在 404；不修改批次或事件） |
 | `GET` | `/health` | 健康检查 |
 
 错误响应统一格式：`{"error": {"code": "...", "message": "...", ...}}`。
@@ -500,6 +550,45 @@ curl -s 'http://localhost:8000/api/releases/<ID>/events?node=svc-b&event_type=ro
 #    {"error":{"code":"invalid_cursor","message":"游标与当前批次或过滤条件不匹配：...", ...}}
 ```
 
+排程推演示例（只读，忽略实际回报状态；节点 a=2s, b=5s, c=3s, d=1s，c 依赖 a/b，d 依赖 c）：
+
+```bash
+# 1) 大并行度：等同关键路径排程，总工期 9（b->c->d）
+curl -s -X POST http://localhost:8000/api/releases/<ID>/simulation \
+  -H 'Content-Type: application/json' \
+  -d '{"parallelism": 10}'
+# -> {
+#   "release_id": "<ID>", "version": "...", "resources": {}, "parallelism": 10,
+#   "total_duration_seconds": 9,
+#   "nodes": [
+#     {"name":"svc-a","resource":null,"estimated_seconds":2,"start_seconds":0,"finish_seconds":2},
+#     {"name":"svc-b","resource":null,"estimated_seconds":5,"start_seconds":0,"finish_seconds":5},
+#     {"name":"svc-c","resource":null,"estimated_seconds":3,"start_seconds":5,"finish_seconds":8},
+#     {"name":"svc-d","resource":null,"estimated_seconds":1,"start_seconds":8,"finish_seconds":9}
+#   ]
+# }
+
+# 2) parallelism=1：字典序串行；a(0-2) -> b(2-7) -> c(7-10) -> d(10-11)，总工期 11
+curl -s -X POST http://localhost:8000/api/releases/<ID>/simulation \
+  -H 'Content-Type: application/json' -d '{"parallelism": 1}'
+
+# 3) 资源互斥：a、b 共用同一资源（即使并行度充足也必须串行，字典序 a 先）
+curl -s -X POST http://localhost:8000/api/releases/<ID>/simulation \
+  -H 'Content-Type: application/json' \
+  -d '{"parallelism": 10, "resources": {"svc-a": "db-primary", "svc-b": "db-primary"}}'
+# -> a(0-2)、b(2-7) 串行释放资源，c(7-10)、d(10-11)，总工期 11
+#    未映射资源的 c / d 节点 resource=null，不参与资源互斥
+
+# 4) 零工期节点即时完成并继续调度（z 无 estimated_seconds，按 0；z 是 d 的前置）
+#    z(0-0) 不阻塞 d；parallelism=1 时零工期节点也不占并行度空位
+
+# 5) 错误：映射了批次中不存在的节点 -> 422 unknown_simulation_node
+#    {"error":{"code":"unknown_simulation_node","nodes":["ghost"], ...}}
+#    parallelism=0 / "2" / true / 缺字段、resources 资源名为空串等 -> 422
+#    批次不存在 -> 404 release_not_found
+# 推演全程只读：可对已成功 / 已取消批次调用，批次状态、节点状态与事件均不改变
+```
+
 循环依赖示例（返回 `422`）：
 
 ```bash
@@ -519,7 +608,7 @@ curl -i -X POST http://localhost:8000/api/releases \
 │   ├── database.py    # SQLite 连接、建表、事务
 │   ├── models.py      # 请求模型
 │   ├── errors.py      # 业务异常
-│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 安全取消 / 批次差异与影响面 / 事件审计
+│   └── service.py     # 拓扑分层 / 批次 / 回报 / 回滚 / 重试 / 安全取消 / 批次差异与影响面 / 事件审计 / 只读排程推演
 ├── requirements.txt
 ├── smoke_test.py      # 端到端冒烟测试（pip install httpx 后 python3 smoke_test.py）
 ├── Dockerfile         # 构建期安装依赖
@@ -556,4 +645,8 @@ succeeded/failed 取消 409 cancel_not_allowed、取消后 report/retry 409 rele
 cancelled 并清等待标记保留尝试历史、旧库补列 revision/cancel_reason/cancelled_at 且旧批次可取消）、
 节点事件审计（全类型事件按 created_at+id 稳定排序、event_type/node 过滤与组合、未知类型空页、
 limit 1~200 校验、游标分页多页遍历与全量一致、翻页间隙并发写入不重复不遗漏、
-游标绑定批次与过滤条件跨用 422、非法/损坏/空游标 422 invalid_cursor、批次 404、只读不改状态）。
+游标绑定批次与过滤条件跨用 422、非法/损坏/空游标 422 invalid_cursor、批次 404、只读不改状态）、
+只读排程推演（大并行度等同关键路径最早开始、parallelism=1 字典序串行、空位受依赖阻塞跳至最近完成时刻、
+同资源节点互斥而未映射节点不占资源、资源占用跳过与释放后继续调度、零工期即时完成不占空位并级联调度、
+零工期与正工期同资源互斥、全部零工期总工期为 0、缺失工期按 0、未知映射节点 422 unknown_simulation_node、
+parallelism 正整数与资源名非空等参数校验 422、批次不存在 404、忽略实际回报状态且推演不修改批次/事件）。

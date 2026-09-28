@@ -10,7 +10,12 @@ from typing import Any
 
 from .database import get_conn, lock, transaction
 from .errors import APIError
-from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest
+from .models import (
+    CancelReleaseRequest,
+    CreateReleaseRequest,
+    ReportRequest,
+    SimulationRequest,
+)
 
 # 节点状态
 PENDING, SUCCESS, FAILED, ROLLED_BACK, CANCELLED = (
@@ -215,6 +220,154 @@ def prune_to_targets(
 
     kept_edges = [(frm, to) for frm, to in dict.fromkeys(edges) if frm in kept and to in kept]
     return kept, kept_edges
+
+
+# --------------------------------------------------------------------------- #
+# 只读排程推演（离散事件模拟：并行度 + 资源互斥）
+# --------------------------------------------------------------------------- #
+def simulate_schedule(
+    node_names: list[str],
+    durations: dict[str, int],
+    edges: list[tuple[str, str]],
+    parallelism: int,
+    resources: dict[str, str],
+) -> dict[str, Any]:
+    """从零时刻离散事件模拟，忽略任何实际回报状态。
+
+    调度规则（确定、可复现）：
+    - 每个时刻先释放全部已完成节点（完成时刻 == 当前时刻），释放其并行度空位与资源；
+    - 再按节点名**字典序**扫描“所有前置均已完成”且尚未启动的节点：
+      映射了资源的节点若该资源正被占用则跳过（本轮之后也不再回看，等下一个完成时刻），
+      否则在并行度有空位时启动，并尽量把空位填满（未映射资源的节点不占资源、只占空位）；
+    - 零工期节点在当前时刻立即完成（start == finish），不占并行度空位、不长期持有资源，
+      完成后继续调度（同一时刻可级联解锁后继）；正工期节点运行不可中断；
+    - 填满一轮后跳至最近的运行完成时刻，重复以上过程直至全部节点完成。
+
+    传入的图在批次创建时已校验为无环 DAG 且依赖边不悬空，因此模拟必然推进到全部完成；
+    推演纯函数式、不读写数据库，调用方负责保证节点名 / 工期 / 依赖来自已持久化的批次。
+    """
+    names = sorted(node_names)
+    prereqs: dict[str, set[str]] = defaultdict(set)
+    for frm, to in dict.fromkeys(edges):
+        prereqs[to].add(frm)
+
+    remaining = set(names)          # 尚未完成
+    started: set[str] = set()       # 已启动（完成即从 remaining 移除但仍留在 started）
+    finished: set[str] = set()
+    # 当前正在运行的正工期节点：节点 -> 完成时刻；零工期节点即时完成、不入此表
+    running: dict[str, int] = {}
+    busy_resources: set[str] = set()
+    start_of: dict[str, int] = {}
+    finish_of: dict[str, int] = {}
+
+    now = 0
+    while remaining:
+        # 1) 先释放全部在当前时刻完成的节点
+        done_now = [n for n, end in running.items() if end == now]
+        for name in done_now:
+            del running[name]
+            resource = resources.get(name)
+            if resource is not None:
+                busy_resources.discard(resource)
+            remaining.remove(name)
+            finished.add(name)
+
+        # 2) 字典序扫描、尽量填满空位；零工期节点即时完成后继续本时刻调度
+        #    外层循环仅在本轮有零工期节点完成（可能解锁后继 / 释放资源）时才需要重扫
+        progress = True
+        while progress and remaining:
+            progress = False
+            for name in names:
+                if name in started or name not in remaining:
+                    continue
+                if not prereqs[name] <= finished:
+                    continue
+                resource = resources.get(name)
+                if resource is not None and resource in busy_resources:
+                    continue
+                duration = durations[name]
+                if len(running) >= parallelism and duration > 0:
+                    continue  # 并行度空位已被占满；零工期节点即时完成不占空位
+                # 启动该节点
+                started.add(name)
+                start_of[name] = now
+                finish_of[name] = now + duration
+                if duration == 0:
+                    # 即时完成：不占用并行度空位，资源在“同一时刻”立刻释放，
+                    # 随后续扫描继续调度其后继 / 同资源节点
+                    remaining.remove(name)
+                    finished.add(name)
+                    progress = True
+                else:
+                    running[name] = finish_of[name]
+                    if resource is not None:
+                        busy_resources.add(resource)
+
+        if not remaining:
+            break
+        # 3) 运行不可中断：跳至最近的完成时刻。
+        #    批次图创建时已校验为无环 DAG 且边不悬空：仍有未完成节点时必存在
+        #    前置全部完成的节点，而它要么已在运行、要么在零工期级联中被处理，
+        #    因此 running 不可能为空（不变量，空则说明图不变量被破坏）。
+        now = min(running.values())
+
+    total_duration = max(finish_of.values(), default=0)
+    return {
+        "parallelism": parallelism,
+        "total_duration_seconds": total_duration,
+        "nodes": [
+            {
+                "name": name,
+                "resource": resources.get(name),
+                "estimated_seconds": durations[name],
+                "start_seconds": start_of[name],
+                "finish_seconds": finish_of[name],
+            }
+            for name in names
+        ],
+    }
+
+
+def simulate_release(release_id: str, payload: SimulationRequest) -> dict[str, Any]:
+    """只读排程推演：读取批次已保存的节点 / 依赖 / estimated_seconds，从零时刻模拟。
+
+    忽略节点的实际回报状态（pending/success/failed/...）与重试信息；不开启写事务、
+    不修改批次、节点或事件。映射中的未知节点返回 422 unknown_simulation_node；
+    批次不存在返回 404 release_not_found。
+    """
+    with lock():
+        conn = get_conn()
+        r = dict(_get_release_row(conn, release_id))
+        node_rows = conn.execute(
+            "SELECT name, estimated_seconds FROM nodes WHERE release_id = ?",
+            (release_id,),
+        ).fetchall()
+        edge_rows = conn.execute(
+            "SELECT from_node, to_node FROM edges WHERE release_id = ?", (release_id,)
+        ).fetchall()
+
+    known = {row["name"] for row in node_rows}
+    resources = payload.resources or {}
+    unknown = sorted(set(resources) - known)
+    if unknown:
+        raise APIError(
+            422, "unknown_simulation_node",
+            f"资源映射引用了批次中不存在的节点: {', '.join(unknown)}",
+            {"nodes": unknown},
+        )
+
+    durations = {row["name"]: int(row["estimated_seconds"] or 0) for row in node_rows}
+    edge_pairs = [(row["from_node"], row["to_node"]) for row in edge_rows]
+    result = simulate_schedule(
+        list(known), durations, edge_pairs, payload.parallelism, dict(resources),
+    )
+
+    return {
+        "release_id": r["id"],
+        "version": r["version"],
+        "resources": dict(resources),
+        **result,
+    }
 
 
 # --------------------------------------------------------------------------- #

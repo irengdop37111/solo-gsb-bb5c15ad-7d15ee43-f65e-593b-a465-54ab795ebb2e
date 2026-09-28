@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# 非空字符串：节点名 / 资源名等不允许空串
+NonEmptyStr = Annotated[str, Field(min_length=1)]
 
 
 class NodeInput(BaseModel):
@@ -52,3 +55,41 @@ class CancelReleaseRequest(BaseModel):
         ..., ge=1,
         description="乐观锁：调用方最后一次看到的批次修订号；与当前 revision 不一致时返回 409 state_conflict 且状态不变",
     )
+
+
+class SimulationRequest(BaseModel):
+    """只读排程推演请求：并行度 + 可选节点到资源名的映射。"""
+
+    parallelism: int = Field(
+        ..., ge=1,
+        description="同时运行的最大节点数（正整数）；运行不可中断，未映射资源的节点只占并行度空位",
+    )
+    resources: dict[NonEmptyStr, NonEmptyStr] | None = Field(
+        None,
+        description="可选节点名 -> 非空资源名映射；同一资源上的节点互斥（同一时刻至多一个在运行），"
+                    "未映射的节点不占任何资源",
+    )
+
+    @field_validator("parallelism", mode="before")
+    @classmethod
+    def _strict_positive_int(cls, v: Any) -> Any:
+        # pydantic 默认会把 bool / 数字字符串 / 整数浮点强转为 int；
+        # 此处明确只接受真正的 int（正整数范围由 Field(ge=1) 兜底）
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError("parallelism 必须为正整数")
+        return v
+
+    @field_validator("resources", mode="before")
+    @classmethod
+    def _non_empty_resources(cls, v: Any) -> Any:
+        # dict 的强转（如 [["a","r"]]）也一并拒绝，只接受真正的 JSON 对象 / 键值序列；
+        # 键 / 值必须为非空字符串：键的 min_length 由 Annotated 校验，空串值在此提前拒绝
+        if v is not None:
+            if not isinstance(v, dict):
+                raise ValueError("resources 必须为对象（节点名到资源名的映射）")
+            for name, resource in v.items():
+                if not isinstance(name, str) or not name:
+                    raise ValueError("resources 的键必须为非空节点名")
+                if not isinstance(resource, str) or not resource:
+                    raise ValueError(f"节点 {name!r} 的资源名必须为非空字符串")
+        return v
