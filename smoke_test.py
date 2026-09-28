@@ -1320,4 +1320,160 @@ assert client.get(f"/api/releases/{ride}").json()["status"] == "cancelled"
 assert client.get(f"/api/releases/{ridl}").json()["status"] == "succeeded"
 print("[OK] events：limit/参数校验、404 与只读语义")
 
+# --- 只读排程推演 POST /api/releases/{id}/simulation ---
+# 图：a(3)->c(4)、b(5)->c；d(2) 独立
+rs = client.post("/api/releases", json={
+    "version": "sim-v1",
+    "nodes": [
+        {"name": "a", "estimated_seconds": 3},
+        {"name": "b", "estimated_seconds": 5},
+        {"name": "c", "estimated_seconds": 4},
+        {"name": "d", "estimated_seconds": 2},
+    ],
+    "dependencies": [
+        {"from_node": "a", "to_node": "c"},
+        {"from_node": "b", "to_node": "c"},
+    ],
+})
+assert rs.status_code == 201, rs.text
+rsim = rs.json()["id"]
+
+# parallelism=2 无资源：t0 启动 a,b；t3 a 完成，字典序扫描 c 仍被 b 阻塞、d 可启动；
+# t5 b/d 完成后 c 启动（5..9），总工期 9
+r = client.post(f"/api/releases/{rsim}/simulation", json={"parallelism": 2})
+assert r.status_code == 200, r.text
+sim = r.json()
+assert sim["total_duration_seconds"] == 9
+assert sim["parallelism"] == 2 and sim["resources"] == {}
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("a", 0, 3), ("b", 0, 5), ("c", 5, 9), ("d", 3, 5)]
+assert all(n["resource"] is None and n["estimated_seconds"] > 0 for n in sim["nodes"])
+print("[OK] simulation：parallelism=2 字典序贪心调度与跳至最近完成时刻")
+
+# parallelism=1：a(0..3) -> b(3..8)；t8 时 c 前置齐先于 d 启动 -> c(8..12) -> d(12..14)
+sim = client.post(f"/api/releases/{rsim}/simulation", json={"parallelism": 1}).json()
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("a", 0, 3), ("b", 3, 8), ("c", 8, 12), ("d", 12, 14)]
+assert sim["total_duration_seconds"] == 14
+print("[OK] simulation：parallelism=1 串行 + 同刻字典序 c 先于 d")
+
+# 同资源互斥：a/b 映射同一资源 db，即便 parallelism=10 也必须串行；
+# 未映射的 d 不占资源，与 a 并行（0..2）；c 等两者齐后 8..12
+sim = client.post(f"/api/releases/{rsim}/simulation", json={
+    "parallelism": 10, "resources": {"a": "db", "b": "db"},
+}).json()
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("a", 0, 3), ("b", 3, 8), ("c", 8, 12), ("d", 0, 2)]
+assert sim["total_duration_seconds"] == 12
+res_of = {n["node"]: n["resource"] for n in sim["nodes"]}
+assert res_of == {"a": "db", "b": "db", "c": None, "d": None}
+assert sim["resources"] == {"a": "db", "b": "db"}  # 回显按键排序
+print("[OK] simulation：同资源节点互斥、未映射节点不占资源")
+
+# 跳过资源被占用者但继续填满后续空位：parallelism=2，b/d 共用 r1
+# t0 启动 a、b；d 资源被占跳过（仍有空位也不启动）；t3 a 完成时 d 仍被 b 阻塞；
+# t5 b 释放 r1：c、d 同刻启动（c 5..9，d 5..7）
+sim = client.post(f"/api/releases/{rsim}/simulation", json={
+    "parallelism": 2, "resources": {"b": "r1", "d": "r1"},
+}).json()
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("a", 0, 3), ("b", 0, 5), ("c", 5, 9), ("d", 5, 7)]
+assert sim["total_duration_seconds"] == 9
+print("[OK] simulation：资源被占用者跳过且不影响后续节点填空位")
+
+# 零工期：z0(0)->z1(0)->z2(5) 级联；w(4) 独立。parallelism=2 时
+# t0 w 启动占 1 空位，z0/z1 同刻即时完成并放行 z2（0..5），总工期 max(4,5)=5
+rz = client.post("/api/releases", json={
+    "version": "sim-zero",
+    "nodes": [
+        {"name": "z0"}, {"name": "z1"},
+        {"name": "z2", "estimated_seconds": 5},
+        {"name": "w", "estimated_seconds": 4},
+    ],
+    "dependencies": [
+        {"from_node": "z0", "to_node": "z1"},
+        {"from_node": "z1", "to_node": "z2"},
+    ],
+})
+assert rz.status_code == 201
+rzid = rz.json()["id"]
+sim = client.post(f"/api/releases/{rzid}/simulation", json={"parallelism": 2}).json()
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("w", 0, 4), ("z0", 0, 0), ("z1", 0, 0), ("z2", 0, 5)]
+assert sim["total_duration_seconds"] == 5
+# parallelism=1：w(0..4) 先占唯一位，零节点级联推迟到 t=4
+sim = client.post(f"/api/releases/{rzid}/simulation", json={"parallelism": 1}).json()
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("w", 0, 4), ("z0", 4, 4), ("z1", 4, 4), ("z2", 4, 9)]
+assert sim["total_duration_seconds"] == 9
+# 全零工期批次：总工期 0，全部 start=end=0
+rz0 = client.post("/api/releases", json={
+    "version": "sim-all-zero",
+    "nodes": [{"name": "x"}, {"name": "y"}],
+    "dependencies": [{"from_node": "x", "to_node": "y"}],
+}).json()["id"]
+sim = client.post(f"/api/releases/{rz0}/simulation", json={"parallelism": 1}).json()
+assert sim["total_duration_seconds"] == 0
+assert [(n["node"], n["start_seconds"], n["end_seconds"]) for n in sim["nodes"]] == [
+    ("x", 0, 0), ("y", 0, 0)]
+print("[OK] simulation：零工期节点即时完成并继续级联调度；缺失工期按 0")
+
+# 忽略实际回报状态 + 纯只读：先制造回报与事件，推演结果与回报无关且不写状态 / 事件
+client.post(f"/api/releases/{rsim}/report",
+            json={"node": "a", "status": "success", "version": "sim-v1"})
+snap = client.get(f"/api/releases/{rsim}").json()
+events_before = client.get(f"/api/releases/{rsim}/events",
+                           params={"limit": 200}).json()["items"]
+sim = client.post(f"/api/releases/{rsim}/simulation", json={"parallelism": 2}).json()
+assert sim["total_duration_seconds"] == 9  # 与首次推演完全一致（a 已 success 也不特殊处理）
+snap2 = client.get(f"/api/releases/{rsim}").json()
+assert snap2["status"] == snap["status"] and snap2["revision"] == snap["revision"]
+assert {n["name"]: n["status"] for n in snap2["nodes"]} == \
+       {n["name"]: n["status"] for n in snap["nodes"]}
+events_after = client.get(f"/api/releases/{rsim}/events",
+                          params={"limit": 200}).json()["items"]
+assert events_after == events_before  # 推演不产生任何审计事件
+print("[OK] simulation：忽略回报状态且不修改批次 / 节点 / 事件")
+
+# targets 裁剪批次：推演只基于实际持久化的诱导子图
+rt = client.post("/api/releases", json={
+    "version": "sim-targets",
+    "nodes": [{"name": "p", "estimated_seconds": 3},
+              {"name": "q", "estimated_seconds": 100},
+              {"name": "t", "estimated_seconds": 2}],
+    "dependencies": [{"from_node": "p", "to_node": "t"}],
+    "targets": ["t"],
+})
+rtid = rt.json()["id"]
+sim = client.post(f"/api/releases/{rtid}/simulation", json={"parallelism": 4}).json()
+assert [n["node"] for n in sim["nodes"]] == ["p", "t"]  # q 未持久化，推演中不可见
+assert sim["total_duration_seconds"] == 5
+r = client.post(f"/api/releases/{rtid}/simulation",
+                json={"parallelism": 1, "resources": {"q": "db"}})
+assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_node"
+print("[OK] simulation：基于 targets 裁剪后的持久化子图；未入库节点即未知节点")
+
+# 错误处理：404 / 422
+r = client.post("/api/releases/ghost/simulation", json={"parallelism": 1})
+assert r.status_code == 404 and r.json()["error"]["code"] == "release_not_found"
+r = client.post(f"/api/releases/{rsim}/simulation",
+                json={"parallelism": 1, "resources": {"ghost": "db"}})
+assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_node"
+assert r.json()["error"]["nodes"] == ["ghost"]
+for bad in [
+    {}, {"parallelism": 0}, {"parallelism": -1}, {"parallelism": True},
+    {"parallelism": "x"}, {"parallelism": 1.5},
+    {"parallelism": 1, "resources": {"a": ""}},
+    {"parallelism": 1, "resources": {"": "db"}},
+    {"parallelism": 1, "resources": "nope"},
+    {"parallelism": 1, "resources": [["a", "db"]]},
+]:
+    assert client.post(f"/api/releases/{rsim}/simulation", json=bad).status_code == 422, bad
+# resources 可省略 / 为 null / 为空对象，等价于无资源约束
+for body in [{"parallelism": 3}, {"parallelism": 3, "resources": None},
+             {"parallelism": 3, "resources": {}}]:
+    r = client.post(f"/api/releases/{rsim}/simulation", json=body)
+    assert r.status_code == 200 and r.json()["total_duration_seconds"] == 9
+print("[OK] simulation：批次 404、未知节点 / 非法参数 422；resources 缺省 / null / {} 合法")
+
 print("\n全部测试通过 ✔")

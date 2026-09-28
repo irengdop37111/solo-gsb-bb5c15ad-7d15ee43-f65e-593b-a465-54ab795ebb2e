@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# 非空字符串（节点名 / 资源名等）：沿用 min_length=1 的批次内既有约定
+NonEmptyStr = Annotated[str, Field(min_length=1)]
 
 
 class NodeInput(BaseModel):
@@ -52,3 +55,23 @@ class CancelReleaseRequest(BaseModel):
         ..., ge=1,
         description="乐观锁：调用方最后一次看到的批次修订号；与当前 revision 不一致时返回 409 state_conflict 且状态不变",
     )
+
+
+class SimulationRequest(BaseModel):
+    parallelism: int = Field(
+        ..., ge=1,
+        description="总并发上限（正整数）：任一时刻运行中的正工期节点数不超过该值",
+    )
+    resources: dict[NonEmptyStr, NonEmptyStr] | None = Field(
+        None,
+        description="可选节点->资源名映射；键 / 值均为非空字符串。"
+                    "未映射的节点不占资源；映射到同一资源的节点互斥（不可同时运行）",
+    )
+
+    @field_validator("parallelism", mode="before")
+    @classmethod
+    def _reject_bool(cls, v: Any) -> Any:
+        # bool 是 int 子类，pydantic 默认会把 true 接受为 1；正整数参数需显式拒绝
+        if isinstance(v, bool):
+            raise ValueError("parallelism 必须为正整数，不能是布尔值")
+        return v

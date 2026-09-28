@@ -10,7 +10,8 @@ from typing import Any
 
 from .database import get_conn, lock, transaction
 from .errors import APIError
-from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest
+from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest, SimulationRequest
+from .simulation import simulate_schedule
 
 # 节点状态
 PENDING, SUCCESS, FAILED, ROLLED_BACK, CANCELLED = (
@@ -388,6 +389,58 @@ def get_release_plan(
         "execution_rule": "按 level 从小到大执行；同一 level 内节点无依赖关系可并行回报；"
                           "节点所有前置为 success 后才允许回报",
         "created_at": r["created_at"],
+    }
+
+
+def simulate_release(release_id: str, payload: SimulationRequest) -> dict[str, Any]:
+    """只读排程推演：从 0 时刻模拟批次执行，不读取 / 不改变任何回报状态。
+
+    - 仅使用批次**已保存**的节点、依赖与 estimated_seconds（缺失按 0）；
+    - ``parallelism`` 限制总并发，``resources`` 声明节点 -> 非空资源名映射，
+      未映射节点不占资源，同资源节点时间轴互斥；
+    - 纯只读：不开写事务、不写 node_events，批次与节点状态均不变；
+    - 批次不存在返回 404 release_not_found；资源映射引用未知节点返回 422 unknown_node。
+    """
+    with lock():
+        conn = get_conn()
+        r = dict(_get_release_row(conn, release_id))  # 不存在 -> 404 release_not_found
+        node_rows = conn.execute(
+            "SELECT name, estimated_seconds FROM nodes WHERE release_id = ?",
+            (release_id,),
+        ).fetchall()
+        edge_rows = conn.execute(
+            "SELECT from_node, to_node FROM edges WHERE release_id = ?",
+            (release_id,),
+        ).fetchall()
+
+    resources = payload.resources or {}
+    known_names = {row["name"] for row in node_rows}
+    unknown = sorted(set(resources) - known_names)
+    if unknown:
+        raise APIError(
+            422, "unknown_node",
+            f"资源映射引用了批次中不存在的节点: {', '.join(unknown)}",
+            {"nodes": unknown},
+        )
+
+    nodes = [{"name": row["name"],
+              "estimated_seconds": int(row["estimated_seconds"] or 0)}
+             for row in node_rows]
+    edge_pairs = [(row["from_node"], row["to_node"]) for row in edge_rows]
+    result = simulate_schedule(
+        nodes, edge_pairs, parallelism=payload.parallelism, resources=resources,
+    )
+
+    return {
+        "release_id": r["id"],
+        "version": r["version"],
+        "parallelism": payload.parallelism,
+        "resources": dict(sorted(resources.items())),
+        "total_duration_seconds": result["total_duration_seconds"],
+        "nodes": result["nodes"],
+        "simulation_rule": "只读推演：忽略实际回报状态，从 0 时刻开始；每时刻先释放全部已完成节点，"
+                           "再按节点名字典序扫描前置已完成的节点，跳过资源被占用者并尽量填满空位；"
+                           "运行不可中断，随后跳至最近完成时刻；零工期节点即时完成并继续调度",
     }
 
 

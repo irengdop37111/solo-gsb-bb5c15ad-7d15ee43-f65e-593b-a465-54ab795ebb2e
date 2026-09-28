@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from . import config, service
 from .database import init_db
 from .errors import APIError
-from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest
+from .models import CancelReleaseRequest, CreateReleaseRequest, ReportRequest, SimulationRequest
 
 
 @asynccontextmanager
@@ -129,6 +129,25 @@ def list_release_events(
     return service.list_release_events(
         release_id, event_type=event_type, node=node, limit=limit, cursor=cursor,
     )
+
+
+@app.post("/api/releases/{release_id}/simulation", tags=["releases"])
+def simulate_release(release_id: str, payload: SimulationRequest) -> dict:
+    """只读排程推演（what-if），不修改批次或事件。
+
+    读取批次已保存的节点、依赖与 estimated_seconds，**忽略实际回报状态**，从 0 时刻模拟：
+
+    - 请求体含正整数 ``parallelism``（总并发上限）及可选的节点 -> 非空资源名映射 ``resources``；
+    - 未在映射中的节点不占资源；映射到**同一资源**的节点时间轴互斥；
+      任一时刻运行中的正工期节点数不超过 ``parallelism``；
+    - 每个时刻先释放全部已完成节点，再按节点名**字典序**扫描前置均已完成的节点，
+      跳过资源被占用者并尽量填满空位；运行不可中断，随后跳至最近完成时刻；
+    - 零工期节点即时完成并继续调度；缺失工期（estimated_seconds 为空）按 0 处理；
+    - 返回每个节点的开始 / 结束秒数（``start_seconds`` / ``end_seconds``）及总工期。
+
+    未知节点（资源映射键不在批次中）或非法参数返回 **422**；批次不存在返回 **404**。
+    """
+    return service.simulate_release(release_id, payload)
 
 
 @app.post("/api/releases/{release_id}/report", tags=["releases"])
